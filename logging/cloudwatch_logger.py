@@ -12,23 +12,22 @@ from botocore.exceptions import ClientError
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+# Set up logging - WARNING level by default to reduce disk usage
+# Set LOG_LEVEL env var to 'INFO' or 'DEBUG' for more verbose logging
+log_level = os.environ.get('LOG_LEVEL', 'WARNING').upper()
+logging.basicConfig(level=getattr(logging, log_level), format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 def create_cloudwatch_client():
     region = os.environ.get('AWS_REGION', 'us-east-2')
-    logger.info(f"Using AWS region: {region}")
     return boto3.client('logs', region_name=region)
 
 def setup_log_group_and_stream(cloudwatch):
     log_group = os.environ.get('LOG_GROUP', '/aws/nitro-enclaves/enclave')
     log_stream = os.environ.get('LOG_STREAM', 'enclave-logs')
-    logger.info(f"Log group: {log_group}, Log stream: {log_stream}")
 
     try:
         cloudwatch.create_log_group(logGroupName=log_group)
-        logger.info(f"Created log group: {log_group}")
     except ClientError as e:
         if e.response['Error']['Code'] != 'ResourceAlreadyExistsException':
             logger.error(f"Error creating log group: {e}")
@@ -36,7 +35,6 @@ def setup_log_group_and_stream(cloudwatch):
 
     try:
         cloudwatch.create_log_stream(logGroupName=log_group, logStreamName=log_stream)
-        logger.info(f"Created log stream: {log_stream}")
     except ClientError as e:
         if e.response['Error']['Code'] != 'ResourceAlreadyExistsException':
             logger.error(f"Error creating log stream: {e}")
@@ -45,14 +43,14 @@ def setup_log_group_and_stream(cloudwatch):
     return log_group, log_stream
 
 def handle_client(conn, addr, cloudwatch, log_group, log_stream):
-    logger.info(f"Connected by {addr}")
+    logger.debug(f"Connected by {addr}")
     try:
         while True:
             data = conn.recv(1024)
             if not data:
                 break
             message = data.decode()
-            logger.info(f"Received log: {message}")
+            logger.debug(f"Received log: {message}")
             try:
                 cloudwatch.put_log_events(
                     logGroupName=log_group,
@@ -62,14 +60,13 @@ def handle_client(conn, addr, cloudwatch, log_group, log_stream):
                         'message': message
                     }]
                 )
-                logger.info(f"Sent log to CloudWatch: {message}")
             except Exception as e:
                 logger.error(f"Error sending log to CloudWatch: {e}")
     except Exception as e:
         logger.error(f"Error handling connection: {e}")
     finally:
         conn.close()
-        logger.info(f"Connection closed for {addr}")
+        logger.debug(f"Connection closed for {addr}")
 
 def socket_to_cloudwatch(port):
     cloudwatch = create_cloudwatch_client()

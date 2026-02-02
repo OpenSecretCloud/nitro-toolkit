@@ -50,7 +50,7 @@ def handle_client(conn, addr, cloudwatch, log_group, log_stream):
             if not data:
                 break
             message = data.decode()
-            logger.debug(f"Received log: {message}")
+            logger.debug("Forwarding log to CloudWatch")
             try:
                 cloudwatch.put_log_events(
                     logGroupName=log_group,

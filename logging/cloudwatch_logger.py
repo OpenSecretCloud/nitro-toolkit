@@ -4,6 +4,7 @@ import time
 import os
 import json
 import sys
+import codecs
 import threading
 import logging
 from botocore.exceptions import ClientError
@@ -44,12 +45,15 @@ def setup_log_group_and_stream(cloudwatch):
 
 def handle_client(conn, addr, cloudwatch, log_group, log_stream):
     logger.debug(f"Connected by {addr}")
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
     try:
         while True:
             data = conn.recv(1024)
             if not data:
                 break
-            message = data.decode()
+            message = decoder.decode(data)
+            if not message:
+                continue
             logger.debug("Forwarding log to CloudWatch")
             try:
                 cloudwatch.put_log_events(
@@ -58,6 +62,21 @@ def handle_client(conn, addr, cloudwatch, log_group, log_stream):
                     logEvents=[{
                         'timestamp': int(time.time() * 1000),
                         'message': message
+                    }]
+                )
+            except Exception as e:
+                logger.error(f"Error sending log to CloudWatch: {e}")
+
+        remaining = decoder.decode(b'', final=True)
+        if remaining:
+            logger.debug("Forwarding log to CloudWatch")
+            try:
+                cloudwatch.put_log_events(
+                    logGroupName=log_group,
+                    logStreamName=log_stream,
+                    logEvents=[{
+                        'timestamp': int(time.time() * 1000),
+                        'message': remaining
                     }]
                 )
             except Exception as e:

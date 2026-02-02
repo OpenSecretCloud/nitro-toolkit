@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import argparse
+import time
 import boto3
 from botocore.exceptions import ClientError
 
@@ -117,6 +118,9 @@ def handle_client(conn, addr):
                 "Region": region
             }
             response = ParentResponse("credentials", response_value)
+            conn.send(json.dumps(response.__dict__).encode())
+        elif request.request_type == "ping":
+            response = ParentResponse("pong", {"unix_ms": int(time.time() * 1000)})
             conn.send(json.dumps(response.__dict__).encode())
         elif request.request_type == "SecretsManager":
             if not request.key_name:

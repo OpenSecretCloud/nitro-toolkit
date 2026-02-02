@@ -29,7 +29,6 @@ def forward(source, destination, connection_id, direction):
                 if not data:
                     logging.info(f"Connection {connection_id}: End of data stream ({direction})")
                     break
-                logging.info(f"Forwarding {len(data)} bytes")
                 destination.sendall(data)
             except socket.timeout:
                 continue  # Check shutdown flag

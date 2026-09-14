@@ -66,9 +66,9 @@ A Python utility for forwarding network traffic between Nitro Enclaves and exter
 #### Features
 - Bidirectional traffic forwarding
 - Support for both TCP and VSOCK protocols
-- Automatic reconnection on failure
 - Configurable endpoints
-- Thread-safe operation
+- Partial-write and backpressure handling without dropping unsent bytes
+- Graceful half-close and connection-scoped cleanup on errors
 
 #### Usage
 ```python
@@ -78,6 +78,31 @@ python traffic_forwarder.py <local_ip> <local_port> <remote_cid> <remote_port>
 # Example: Forward from localhost:8080 to enclave CID 3 port 5000
 python traffic_forwarder.py 127.0.0.1 8080 3 5000
 ```
+
+The 30-second timeout applies to establishing the VSOCK connection. After
+connection, the one-second socket timeout is a shutdown polling interval, not
+an idle or request deadline. A slow writer retains its pending bytes across
+polls. Clean EOF propagates a write half-close so the reverse direction can
+finish. A forwarding error stops both directions. The helper does not replay
+requests or reconnect an existing connection; retry policy belongs to callers.
+
+Connection log identifiers have the form `PID:sequence@CID:port`. This separates
+helpers targeting different services when they share an enclave log stream.
+`client->server` means local TCP application to VSOCK; `server->client` means
+VSOCK to local application. `Peer disconnected` at INFO records EPIPE or
+ECONNRESET with direction, operation and forwarded byte count. It does not
+establish whether an application request succeeded, failed, or was cancelled.
+Other forwarding failures remain ERROR. Payloads and raw exception messages
+are not logged by the forwarding loop.
+
+Run the standalone, offline socket and lifecycle regression tests with:
+
+```sh
+python3 -B -m unittest -v test_traffic_forwarder
+```
+
+These tests use synthetic data and local sockets. They do not validate the
+Linux VSOCK driver, an enclave image, or deployed provider connections.
 
 ### VSOCK Helper
 

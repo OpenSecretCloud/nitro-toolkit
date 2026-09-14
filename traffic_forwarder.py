@@ -1,10 +1,10 @@
 import socket
 import sys
 import threading
-import time
 import logging
 import signal
 import os
+import errno
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,51 +19,78 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-def forward(source, destination, connection_id, direction):
-    """Forward data between sockets with proper cleanup"""
+def shutdown_socket(sock, how):
+    """Best-effort shutdown; the connection owner closes sockets after joining."""
     try:
-        source.settimeout(1.0)  # 1 second timeout for checking shutdown
-        while not shutdown_flag.is_set():
+        sock.shutdown(how)
+    except OSError:
+        pass
+
+
+def forward(source, destination, connection_id, direction, stop_event=None):
+    """Forward in one direction, retaining unsent bytes across polling timeouts."""
+    if stop_event is None:
+        stop_event = threading.Event()
+    operation = "recv"
+    bytes_forwarded = 0
+    eof = False
+    try:
+        while not shutdown_flag.is_set() and not stop_event.is_set():
+            operation = "recv"
             try:
                 data = source.recv(1024)
-                if not data:
-                    logging.info(f"Connection {connection_id}: End of data stream ({direction})")
-                    break
-                destination.sendall(data)
             except socket.timeout:
-                continue  # Check shutdown flag
-            except OSError as e:
-                # Check if it's a bad file descriptor or transport endpoint error
-                if e.errno in (9, 107) or "Bad file descriptor" in str(e) or "Transport endpoint is not connected" in str(e):
-                    # Socket was closed by the other thread, this is normal during shutdown
-                    logging.debug(f"Connection {connection_id}: Socket closed by peer ({direction})")
-                else:
-                    logging.error(f"Connection {connection_id}: Forwarding error ({direction}): {e}")
+                continue
+            if not data:
+                eof = True
+                logging.info("Connection %s: End of data stream (%s)", connection_id, direction)
                 break
-            except Exception as e:
-                if not shutdown_flag.is_set():
-                    logging.error(f"Connection {connection_id}: Forwarding error ({direction}): {e}")
-                break
-    except Exception as e:
-        logging.error(f"Connection {connection_id}: Fatal error ({direction}): {e}")
+
+            # sendall() does not report how much it sent when it times out.
+            # Each send() reports progress, so a slow reader cannot make us
+            # discard a suffix or replay bytes that were already written.
+            operation = "send"
+            pending = memoryview(data)
+            while pending and not shutdown_flag.is_set() and not stop_event.is_set():
+                try:
+                    sent = destination.send(pending)
+                except socket.timeout:
+                    continue
+                if sent == 0:
+                    raise ConnectionResetError(errno.ECONNRESET, "Socket write made no progress")
+                bytes_forwarded += sent
+                pending = pending[sent:]
+    except OSError as e:
+        if not shutdown_flag.is_set() and not stop_event.is_set():
+            # These report a peer disconnect, not an application request outcome.
+            log = logging.info if e.errno in (errno.EPIPE, errno.ECONNRESET) else logging.error
+            reason = "Peer disconnected" if e.errno in (errno.EPIPE, errno.ECONNRESET) else "Forwarding error"
+            log("Connection %s: %s direction=%s operation=%s errno=%s bytes_forwarded=%d",
+                connection_id, reason, direction, operation, e.errno, bytes_forwarded)
+        stop_event.set()
+    except Exception:
+        if not shutdown_flag.is_set() and not stop_event.is_set():
+            logging.error("Connection %s: Forwarding error direction=%s operation=%s reason=unexpected_exception",
+                          connection_id, direction, operation)
+        stop_event.set()
     finally:
-        # Only shutdown our reading side and their writing side
-        try:
-            if direction == "client->server":
-                source.shutdown(socket.SHUT_RD)
-                destination.shutdown(socket.SHUT_WR)
-            else:  # server->client
-                source.shutdown(socket.SHUT_RD)
-                destination.shutdown(socket.SHUT_WR)
-        except OSError:
-            # Socket might already be closed, that's OK
-            pass
+        if eof and not shutdown_flag.is_set() and not stop_event.is_set():
+            # A clean EOF is a half-close. The other direction may still have
+            # a response to deliver; do not close its reading or writing side.
+            shutdown_socket(destination, socket.SHUT_WR)
+        else:
+            stop_event.set()
+            # A failed direction cannot make further progress. Wake its peer
+            # worker even if that worker is waiting on an otherwise idle socket.
+            shutdown_socket(source, socket.SHUT_RDWR)
+            shutdown_socket(destination, socket.SHUT_RDWR)
         logging.info(f"Connection {connection_id}: Completed ({direction})")
 
 def handle_connection(client_socket, client_addr, remote_cid, remote_port, connection_id):
     """Handle a single connection with proper resource management"""
     server_socket = None
     threads = []
+    stop_event = threading.Event()
     
     try:
         # Connect to VSOCK
@@ -71,16 +98,20 @@ def handle_connection(client_socket, client_addr, remote_cid, remote_port, conne
         server_socket.settimeout(30)  # 30 second timeout for connection
         server_socket.connect((remote_cid, remote_port))
         logging.info(f"Connection {connection_id}: Connected to VSOCK {remote_cid}:{remote_port}")
+        # Each socket is read by one worker and written by the other. Configure
+        # polling before either starts, rather than racing to change its timeout.
+        client_socket.settimeout(1.0)
+        server_socket.settimeout(1.0)
         
         # Create forwarding threads
         outgoing_thread = threading.Thread(
             target=forward, 
-            args=(client_socket, server_socket, connection_id, "client->server"),
+            args=(client_socket, server_socket, connection_id, "client->server", stop_event),
             name=f"forward-{connection_id}-out"
         )
         incoming_thread = threading.Thread(
             target=forward, 
-            args=(server_socket, client_socket, connection_id, "server->client"),
+            args=(server_socket, client_socket, connection_id, "server->client", stop_event),
             name=f"forward-{connection_id}-in"
         )
         
@@ -95,8 +126,18 @@ def handle_connection(client_socket, client_addr, remote_cid, remote_port, conne
             thread.join()
             
     except Exception as e:
-        logging.error(f"Connection {connection_id}: Failed to establish connection: {e}")
+        logging.error("Connection %s: Connection setup failed errno=%s",
+                      connection_id, e.errno if isinstance(e, OSError) else None)
     finally:
+        stop_event.set()
+        # Also cover partial worker startup. Sockets must outlive any worker
+        # that started successfully, including when its partner could not start.
+        for sock in [client_socket, server_socket]:
+            if sock:
+                shutdown_socket(sock, socket.SHUT_RDWR)
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join()
         # Now that both forwarding threads are done, we can fully close the sockets
         for sock in [client_socket, server_socket]:
             if sock:
@@ -126,7 +167,9 @@ def server(local_ip, local_port, remote_cid, remote_port):
             try:
                 client_socket, client_addr = dock_socket.accept()
                 connection_counter += 1
-                connection_id = f"{connection_counter}"
+                # Many helpers share one enclave log stream. Include only safe
+                # process/endpoint metadata, never traffic or request contents.
+                connection_id = f"{os.getpid()}:{connection_counter}@{remote_cid}:{remote_port}"
                 logging.info(f"Connection {connection_id}: Accepted from {client_addr}")
                 
                 # Handle connection in a separate thread
